@@ -227,8 +227,6 @@ func (s *Session) Connect(ctx context.Context) error {
 		err := jSess.OpenBridge(bctx)
 		bcancel()
 		if err != nil {
-			_ = jSess.Close()
-			s.jSess.Store(nil)
 			return fmt.Errorf("open bridge: %w", err)
 		}
 		s.bridgeReady.Store(true)
@@ -237,9 +235,6 @@ func (s *Session) Connect(ctx context.Context) error {
 
 	if s.shouldNegotiatePC() {
 		if err := s.negotiatePC(ctx, jSess); err != nil {
-			_ = jSess.Close()
-			s.jSess.Store(nil)
-			s.bridgeReady.Store(false)
 			return err
 		}
 	}
