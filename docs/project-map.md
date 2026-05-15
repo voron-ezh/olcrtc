@@ -164,6 +164,11 @@ Defaults are `liveness.interval: 10s`, `liveness.timeout: 5s`, and
 `liveness.failures: 3`. Missed pongs mark the smux session unhealthy and
 trigger a session rebuild/reconnect path.
 
+Client and server runtimes also maintain a `control.Status` snapshot with
+session ID, last pong time, RTT, missed pongs, reconnect count, and unhealthy
+event count. Embedders can consume it through the client/server health
+callbacks.
+
 ## Registries And Plugin Shape
 
 The universal-carrier refactor centers on small registries:
@@ -339,7 +344,7 @@ still the natural place for:
 - Server policy updates.
 - Graceful reconnect notifications.
 - Drain/start markers for failover.
-- Per-session stats.
+- More per-session stats.
 
 Likely files:
 

@@ -422,6 +422,7 @@ func TestStartControlLoopReportsPong(t *testing.T) {
 			},
 		},
 	}
+	s.recordSession("sid-control")
 	defer func() {
 		cancel()
 		s.wg.Wait()
@@ -442,6 +443,31 @@ func TestStartControlLoopReportsPong(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for control pong")
+	}
+	status := s.Status()
+	if status.SessionID != "sid-control" {
+		t.Fatalf("Status.SessionID = %q, want sid-control", status.SessionID)
+	}
+	if status.LastPong.IsZero() || status.LastRTT < 0 || status.MissedPongs != 0 {
+		t.Fatalf("Status() = %+v", status)
+	}
+}
+
+func TestStatusRecordsReconnectAndUnhealthy(t *testing.T) {
+	updates := 0
+	s := &Server{onHealth: func(control.Status) { updates++ }}
+	s.recordSession("sid-1")
+	s.recordMissed(2)
+	s.recordUnhealthy(3)
+	s.recordReconnect()
+
+	status := s.Status()
+	if status.SessionID != "sid-1" || status.MissedPongs != 3 ||
+		status.UnhealthyEvents != 1 || status.Reconnects != 1 || status.LastUnhealthy.IsZero() {
+		t.Fatalf("Status() = %+v", status)
+	}
+	if updates != 4 {
+		t.Fatalf("health updates = %d, want 4", updates)
 	}
 }
 

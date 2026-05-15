@@ -71,6 +71,18 @@ type Health struct {
 	LastSeen time.Time
 }
 
+// Status is a point-in-time view of control-stream health maintained by
+// callers that embed the control loop.
+type Status struct {
+	SessionID       string
+	LastPong        time.Time
+	LastRTT         time.Duration
+	MissedPongs     int
+	Reconnects      uint64
+	UnhealthyEvents uint64
+	LastUnhealthy   time.Time
+}
+
 // Config controls the liveness loop.
 type Config struct {
 	Interval time.Duration
@@ -79,6 +91,8 @@ type Config struct {
 
 	// OnPong is called after a matching pong is received.
 	OnPong func(Health)
+	// OnMissedPong is called when one or more outstanding pongs time out.
+	OnMissedPong func(missed int)
 	// OnUnhealthy is called before Run returns [ErrUnhealthy].
 	OnUnhealthy func(missed int)
 }
@@ -195,16 +209,21 @@ func (s *state) sendProbe(ctx context.Context) error {
 	now := s.now()
 
 	s.mu.Lock()
+	missedNow := 0
 	for seq, sent := range s.pending {
 		if now.Sub(sent) < s.cfg.Timeout {
 			continue
 		}
 		delete(s.pending, seq)
 		s.failures++
+		missedNow++
 	}
+	missed := s.failures
 	if s.failures >= s.cfg.Failures {
-		missed := s.failures
 		s.mu.Unlock()
+		if missedNow > 0 && s.cfg.OnMissedPong != nil {
+			s.cfg.OnMissedPong(missed)
+		}
 		if s.cfg.OnUnhealthy != nil {
 			s.cfg.OnUnhealthy(missed)
 		}
@@ -215,6 +234,9 @@ func (s *state) sendProbe(ctx context.Context) error {
 	seq := s.nextSeq
 	s.pending[seq] = now
 	s.mu.Unlock()
+	if missedNow > 0 && s.cfg.OnMissedPong != nil {
+		s.cfg.OnMissedPong(missed)
+	}
 
 	return s.enqueue(ctx, Message{
 		Version:      ProtoVersion,

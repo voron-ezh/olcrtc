@@ -71,12 +71,19 @@ func TestRunMarksUnhealthyAfterMissedPongs(t *testing.T) {
 	}()
 
 	missedCh := make(chan int, 1)
+	missedCallbackCh := make(chan int, 1)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- Run(ctx, a, Config{
-			Interval:    10 * time.Millisecond,
-			Timeout:     5 * time.Millisecond,
-			Failures:    2,
+			Interval: 10 * time.Millisecond,
+			Timeout:  5 * time.Millisecond,
+			Failures: 2,
+			OnMissedPong: func(missed int) {
+				select {
+				case missedCallbackCh <- missed:
+				default:
+				}
+			},
 			OnUnhealthy: func(missed int) { missedCh <- missed },
 		})
 	}()
@@ -91,6 +98,9 @@ func TestRunMarksUnhealthyAfterMissedPongs(t *testing.T) {
 	}
 	if missed := <-missedCh; missed < 2 {
 		t.Fatalf("missed = %d, want >= 2", missed)
+	}
+	if missed := <-missedCallbackCh; missed < 1 {
+		t.Fatalf("missed callback = %d, want >= 1", missed)
 	}
 }
 
