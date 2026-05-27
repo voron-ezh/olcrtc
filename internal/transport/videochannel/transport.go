@@ -88,9 +88,6 @@ type streamTransport struct {
 	remoteRole      byte
 	bindingToken    uint32
 	runCtx          context.Context //nolint:containedctx,lll // long-lived context drives idle-frame loops bound to this transport's lifetime
-
-	idleFrame   []byte
-	idleFrameMu sync.Mutex
 }
 
 // New creates a visual videochannel transport backed by a carrier engine.
@@ -388,28 +385,18 @@ func (p *streamTransport) Features() transport.Features {
 }
 
 func (p *streamTransport) writeIdleFrame(enc *goEncoder, frameDuration time.Duration) {
-	p.idleFrameMu.Lock()
-	cached := p.idleFrame
-	p.idleFrameMu.Unlock()
-
-	if cached == nil {
-		rawFrame, err := p.renderFrame(nil)
-		if err != nil {
-			logger.Debugf("videochannel render idle error: %v", err)
-			return
-		}
-		sample, err := enc.EncodeFrame(rawFrame)
-		if err != nil {
-			logger.Warnf("videochannel encoder idle error: %v", err)
-			return
-		}
-		p.idleFrameMu.Lock()
-		p.idleFrame = sample
-		p.idleFrameMu.Unlock()
-		cached = sample
+	rawFrame, err := p.renderFrame(nil)
+	if err != nil {
+		logger.Debugf("videochannel render idle error: %v", err)
+		return
+	}
+	sample, err := enc.EncodeFrame(rawFrame)
+	if err != nil {
+		logger.Warnf("videochannel encoder idle error: %v", err)
+		return
 	}
 
-	_ = p.track.WriteSample(media.Sample{Data: cached, Duration: frameDuration})
+	_ = p.track.WriteSample(media.Sample{Data: sample, Duration: frameDuration})
 }
 
 func (p *streamTransport) writePayloadFrame(enc *goEncoder, payload []byte, frameDuration time.Duration) {

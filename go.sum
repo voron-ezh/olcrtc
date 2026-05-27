@@ -7,8 +7,8 @@ buf.build/go/protoyaml v0.7.0/go.mod h1:+a0cavd0uMvirb87xdu2ZMMmjlIQoiH/N2Ich5MG
 cel.dev/expr v0.25.2 h1:K6j46C81hXtZQfuX60cVWQFBJahKSE2gfRbNuvr5bFs=
 cel.dev/expr v0.25.2/go.mod h1:hrXvqGP6G6gyx8UAHSHJ5RGk//1Oj5nXQ2NI02Nrsg4=
 cloud.google.com/go v0.26.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMTw=
-codeberg.org/rape4me/kc v0.0.0-20260527043314-71657a097a6f h1:amyzfF9+4jCUKJndW336YHbj3FiaWs/qkJqOgUyreCA=
-codeberg.org/rape4me/kc v0.0.0-20260527043314-71657a097a6f/go.mod h1:ooInikVAZhJE+m+gHIekq52ZFkUPcCZAvY4u/m2M/V0=
+codeberg.org/rape4me/kc v0.0.0-20260527074346-4cb2a45790c2 h1:u7QorW08YOZGj86cubeGpiwm+d0tMKa0e7syiBkO2eo=
+codeberg.org/rape4me/kc v0.0.0-20260527074346-4cb2a45790c2/go.mod h1:ooInikVAZhJE+m+gHIekq52ZFkUPcCZAvY4u/m2M/V0=
 dario.cat/mergo v1.0.0 h1:AGCNq9Evsj31mOgNPcLyXc+4PNABt905YmuqPYYpBWk=
 dario.cat/mergo v1.0.0/go.mod h1:uNxQE+84aUszobStD9th8a29P2fMDhsBdgRYvZOxGmk=
 github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 h1:L/gRVlceqvL25UVaW/CKtUDjefjrs0SPonmDGUVOYP0=

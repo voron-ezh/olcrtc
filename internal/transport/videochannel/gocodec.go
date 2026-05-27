@@ -20,8 +20,10 @@ type goEncoder struct {
 }
 
 func newGoEncoder(width, height, _ int) *goEncoder {
+	enc := vp8.NewEncoder(width, height, 63)
+	enc.SetKeyInterval(1)
 	return &goEncoder{
-		enc:       vp8.NewEncoder(width, height, 10),
+		enc:       enc,
 		width:     width,
 		height:    height,
 		frameSize: width * height,
@@ -74,12 +76,10 @@ func (d *goDecoder) PushSample(sample []byte) error {
 	}
 	frame, err := d.dec.Decode(sample)
 	if err != nil {
-		// Inter-frame arrived before any keyframe (e.g. SFU started forwarding
-		// mid-GOP). Drop silently; the next keyframe will reset the reference.
 		if errors.Is(err, vp8.ErrNoReference) {
-			return nil
+			return nil // skip inter-frames until keyframe arrives
 		}
-		return fmt.Errorf("vp8 decode: %w", err)
+		return nil // skip undecodable frames (e.g. from other participants)
 	}
 	gray := frame.Grayscale()
 	select {
