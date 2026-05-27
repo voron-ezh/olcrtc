@@ -45,6 +45,20 @@ Community ui client: [alananisimov/olcbox](https://github.com/alananisimov/olcbo
 
 [Client subscription format](docs/sub.md)
 
+# More
+
+Encrypted TCP-over-WebRTC tunnel. Traffic is disguised as a regular video call on whitelisted services (Jitsi, Yandex Telemost, WbStream, More). Inside - XChaCha20-Poly1305 encryption + smux multiplexing over WebRTC data/video channels.
+
+**Supported providers:** `jitsi` - `telemost` - `wbstream`
+
+**Transports:** `datachannel` - `vp8channel` - `seichannel` - `videochannel`
+
+**Platforms:** Linux, macOS, Windows, Android (gomobile), Docker, embeddable Go library
+
+```
+app -> SOCKS5 -> olcrtc cnc -> WebRTC/SFU service -> olcrtc srv -> internet
+```
+
 <div align="center">
 
 ---
