@@ -526,8 +526,12 @@ func (s *Server) serveSingle(ctx context.Context) {
 			if contextDone(ctx) {
 				return
 			}
+			hadSession := s.handshakeReady()
 			logger.Debugf("AcceptStream returned %v - reinstalling session", err)
 			s.reinstallSession(sess)
+			if hadSession && s.ln != nil {
+				s.ln.Reconnect("liveness")
+			}
 			continue
 		}
 
