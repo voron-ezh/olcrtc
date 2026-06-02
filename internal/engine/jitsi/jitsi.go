@@ -88,6 +88,9 @@ var (
 	ErrHostRequired = errors.New("jitsi host required")
 	// ErrRoomRequired is returned when no Jitsi room was supplied.
 	ErrRoomRequired = errors.New("jitsi room required")
+	// errNoPeer is returned by reconnectFull when the WaitJingle timeout
+	// fires because no peer has joined the room yet (not a real failure).
+	errNoPeer = errors.New("no peer in room")
 )
 
 // Session is the Jitsi engine handle.
@@ -348,7 +351,7 @@ func (s *Session) waitForJingle() {
 		s.requestReconnect("wait jingle failed: " + err.Error())
 		return
 	}
-	_ = stanza // parsed below via joinAndOpenBridge path
+	_ = stanza // parsed below via completeJingleSetup path
 
 	// Now do the full join (which will get the already-received jingle from LastJingleStanza).
 	if err := s.completeJingleSetup(s.runCtx, jSess); err != nil {
@@ -389,46 +392,6 @@ func (s *Session) completeJingleSetup(ctx context.Context, jSess *j.Session) err
 	s.wg.Add(1)
 	go s.recvLoop()
 	return nil
-}
-
-func (s *Session) joinAndOpenBridge(ctx context.Context) (*j.Session, error) { //nolint:cyclop // sequential setup steps
-	logger.Infof("jitsi: joining %s/%s as %s …", s.host, s.room, s.name)
-	jSess, err := j.Join(ctx, j.Config{
-		Host:  s.host,
-		Room:  s.room,
-		Nick:  s.name,
-		Debug: logger.IsVerbose(),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("jitsi join: %w", err)
-	}
-	logger.Infof("jitsi: joined %s/%s; colibri-ws=%s", s.host, s.room, jSess.ColibriWS)
-
-	needBridge := s.onData != nil || s.onPeerData != nil
-	sctpBridge := needBridge && jSess.ColibriWS == ""
-
-	if needBridge && !sctpBridge {
-		if err := s.openBridgeWS(ctx, jSess); err != nil {
-			_ = jSess.Close()
-			return nil, err
-		}
-	}
-
-	if s.shouldNegotiatePC() {
-		if err := s.negotiatePC(ctx, jSess, sctpBridge); err != nil {
-			_ = jSess.Close()
-			return nil, err
-		}
-	}
-
-	if sctpBridge {
-		if err := s.openBridgeSCTP(ctx, jSess); err != nil {
-			_ = jSess.Close()
-			return nil, err
-		}
-	}
-
-	return jSess, nil
 }
 
 func (s *Session) openBridgeWS(ctx context.Context, jSess *j.Session) error {
@@ -1509,6 +1472,19 @@ func (s *Session) handleReconnectAttempt(ctx context.Context) bool {
 			return false
 		}
 
+		// errNoPeer means we successfully rejoined the MUC but no peer
+		// is present yet. waitForJingle was restarted — don't burn
+		// reconnect budget, just return and wait for the next signal.
+		if errors.Is(err, errNoPeer) {
+			logger.Infof("jitsi: waiting for peer in room (not a failure)")
+			s.reconnectMu.Lock()
+			s.reconnectCount = 0
+			s.reconnectWindowStart = time.Time{}
+			s.reconnectMu.Unlock()
+			s.drainReconnectQueue()
+			return false
+		}
+
 		logger.Warnf("jitsi reconnect failed: %v", err)
 		s.reconnectMu.Lock()
 		s.reconnectCount++
@@ -1662,13 +1638,11 @@ func (s *Session) reinitiateBridge(ctx context.Context, jSess *j.Session) error 
 	return nil
 }
 
-// reconnectFull tears down everything and does a full rejoin (blocking on session-initiate).
+// reconnectFull tears down everything and does a full rejoin.
 //
-// j.Join blocks on WaitJingle internally, so without a bounded timeout
-// here the supervisor stalls indefinitely whenever Jicofo decides not
-// to issue a session-initiate (peer not in MUC, conference garbage
-// collected, etc). Surfacing a bounded error lets handleReconnectAttempt
-// retry from scratch instead of leaving the engine permanently wedged.
+// If no peer is present in the room, WaitJingle will time out. In that
+// case we park the new MUC session, restart waitForJingle + xmppKeepalive,
+// and return errNoPeer so the caller does not count it as a failure.
 func (s *Session) reconnectFull(ctx context.Context) error {
 	if old := s.jSess.Swap(nil); old != nil {
 		_ = old.Close()
@@ -1679,13 +1653,38 @@ func (s *Session) reconnectFull(ctx context.Context) error {
 	s.drainSendQueue()
 
 	const fullReconnectTimeout = 60 * time.Second
-	bctx, bcancel := context.WithTimeout(ctx, fullReconnectTimeout)
-	defer bcancel()
 
 	logger.Infof("jitsi: full reconnect %s/%s as %s ...", s.host, s.room, s.name)
-	jSess, err := s.joinAndOpenBridge(bctx)
+
+	// First: join the MUC (non-blocking, does not wait for session-initiate).
+	// If this fails, it's a real connectivity problem.
+	jSess, err := j.JoinMUC(ctx, j.Config{
+		Host:  s.host,
+		Room:  s.room,
+		Nick:  s.name,
+		Debug: logger.IsVerbose(),
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("jitsi join: %w", err)
+	}
+
+	// Second: wait for Jicofo session-initiate (requires a peer in the room).
+	// If this times out, it means no peer has joined — not a real failure.
+	bctx, bcancel := context.WithTimeout(ctx, fullReconnectTimeout)
+	_, err = jSess.Conn.WaitJingle(bctx)
+	bcancel()
+	if err != nil {
+		// Park the session so waitForJingle can pick up later.
+		s.jSess.Store(jSess)
+		s.wg.Add(2)
+		go s.waitForJingle()
+		go s.xmppKeepalive()
+		return errNoPeer
+	}
+
+	if err := s.completeJingleSetup(ctx, jSess); err != nil {
+		_ = jSess.Close()
+		return fmt.Errorf("jitsi setup after full reconnect: %w", err)
 	}
 	s.jSess.Store(jSess)
 	s.peerEndpoint.Store(nil)
