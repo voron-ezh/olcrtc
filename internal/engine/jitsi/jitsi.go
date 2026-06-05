@@ -34,6 +34,7 @@ import (
 	pioninterceptor "github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/zarazaex69/j"
 )
 
@@ -75,6 +76,16 @@ const (
 // against real-world payloads while keeping the overhead negligible.
 var bridgeMagic = [4]byte{'O', 'L', 'R', '1'} //nolint:gochecknoglobals // protocol constant
 var fallbackEpoch atomic.Uint32               //nolint:gochecknoglobals // crypto/rand fallback counter
+
+// vp8Keepalive is a minimal valid VP8 keyframe. It carries no useful picture
+// data but parses as a genuine VP8 bitstream, so JVB accepts it as real media
+// and refreshes the endpoint's lastRtpReceived timestamp. These are the same
+// bytes the vp8channel transport uses for its idle keepalive.
+var vp8Keepalive = []byte{ //nolint:gochecknoglobals // protocol constant
+	0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00,
+	0x10, 0x00, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
+	0x99, 0x84, 0x88, 0xfc,
+}
 
 var (
 	// ErrSessionClosed is returned when an operation is attempted on a closed session.
@@ -514,16 +525,47 @@ func (s *Session) negotiatePC(ctx context.Context, jSess *j.Session, sctpBridge 
 	s.videoTrackMu.RUnlock()
 
 	// When sending video, AddTrack already creates the video m-line (sendonly).
-	// When only receiving video, an explicit recvonly transceiver is required
-	// so the SDP answer includes a video m-line. SCTP-only byte streams do not
-	// need a video m-line, so keep that idle path lean.
-	if requestVideo && !hasLocalTracks {
-		if _, err := pc.AddTransceiverFromKind(
-			webrtc.RTPCodecTypeVideo,
-			webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
-		); err != nil {
-			_ = pc.Close()
-			return fmt.Errorf("add video recvonly: %w", err)
+	// When we have no local video we still need a video m-line, and the choice
+	// matters for endpoint liveness on JVB:
+	//
+	//   - Video-receiver paths (onVideoTrack set): a recvonly transceiver so
+	//     JVB sets up forwarding. The inbound RTP keeps the endpoint alive on
+	//     its own, no keepalive track needed.
+	//
+	//   - Pure byte-stream paths (datachannel transport: onData/onPeerData set,
+	//     no video handler): NO media flows. JVB tracks endpoint liveness via
+	//     lastIncomingActivity = max(lastRtpReceived, lastIceConsent); on
+	//     TURN/SCTP paths neither ICE consent nor an empty RTCP RR reliably
+	//     refresh it, so the endpoint is expired after entity-expiration.timeout
+	//     (~1 min) and JVB emits a DTLS close_notify - the head of the reconnect
+	//     cascade we observe. We attach a sendonly VP8 keepalive track and pump
+	//     a tiny keyframe on it (see rtpKeepalive); real RTP is the only signal
+	//     JVB's activity tracker honours on these paths. This mirrors what an
+	//     ordinary Jitsi client (and the vp8channel transport) does implicitly
+	//     by always sending media.
+	//
+	// AddTrack and AddTransceiverFromKind(video,recvonly) are mutually exclusive
+	// on one m-line in Plan B, so these are an either/or.
+	var kaTrack *webrtc.TrackLocalStaticSample
+	if !hasLocalTracks {
+		if s.wantsVideoReceive() {
+			if _, err := pc.AddTransceiverFromKind(
+				webrtc.RTPCodecTypeVideo,
+				webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
+			); err != nil {
+				_ = pc.Close()
+				return fmt.Errorf("add video recvonly: %w", err)
+			}
+		} else {
+			kaTrack, err = newKeepaliveTrack()
+			if err != nil {
+				_ = pc.Close()
+				return fmt.Errorf("create keepalive track: %w", err)
+			}
+			if _, addErr := pc.AddTrack(kaTrack); addErr != nil {
+				_ = pc.Close()
+				return fmt.Errorf("add keepalive track: %w", addErr)
+			}
 		}
 	}
 
@@ -627,6 +669,15 @@ func (s *Session) negotiatePC(ctx context.Context, jSess *j.Session, sctpBridge 
 	s.wg.Add(1)
 	go s.rtcpKeepalive(pcCtx, pc) //nolint:contextcheck // pcCtx intentionally derives from s.runCtx to outlive this call
 
+	// On pure byte-stream paths an empty RTCP RR does not refresh JVB's
+	// lastRtpReceived on this deployment, so we also pump real VP8 RTP on the
+	// keepalive track. Bound to the same pcCtx, so teardownPC stops it and the
+	// next negotiatePC (including a reinitiate) starts a fresh one.
+	if kaTrack != nil {
+		s.wg.Add(1)
+		go s.rtpKeepalive(pcCtx, kaTrack) //nolint:contextcheck // pcCtx intentionally derives from s.runCtx to outlive this call
+	}
+
 	return nil
 }
 
@@ -689,7 +740,82 @@ func (s *Session) rtcpKeepalive(pcCtx context.Context, pc *webrtc.PeerConnection
 	}
 }
 
-// bridgeKeepalive sends a lightweight bridge frame every 10 seconds so JVB
+// rtpKeepalive pumps a tiny VP8 keyframe onto the sendonly keepalive track
+// roughly once a second. It is the byte-stream (datachannel) path's liveness
+// signal to JVB.
+//
+// JVB expires an endpoint once lastIncomingActivity = max(lastRtpReceived,
+// lastIceConsent) goes stale for longer than entity-expiration.timeout
+// (~1 min), then tears down DTLS with a close_notify. On byte-stream paths no
+// media flows, ICE consent refresh is unreliable over TURN, and an empty RTCP
+// RR does not refresh lastRtpReceived on this build - so without real RTP the
+// endpoint dies every ~60-80s and the engine churns through an endless
+// reconnect cascade (works for hours, then a single bridge blip drops us into
+// the loop with no way out). A genuine VP8 packet is the one signal JVB's
+// activity tracker honours.
+//
+// Bound to pcCtx so it exits on teardownPC; negotiatePC starts a fresh
+// instance on every (re)negotiation, including a reinitiate, which is exactly
+// what keeps the reconnected bridge alive instead of expiring again.
+func (s *Session) rtpKeepalive(pcCtx context.Context, track *webrtc.TrackLocalStaticSample) {
+	defer s.wg.Done()
+	const interval = time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	sample := media.Sample{Data: vp8Keepalive, Duration: interval}
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-pcCtx.Done():
+			return
+		case <-ticker.C:
+			if pcCtx.Err() != nil {
+				return
+			}
+			if err := track.WriteSample(sample); err != nil {
+				if s.closed.Load() || pcCtx.Err() != nil {
+					return
+				}
+				// WriteSample fails until the sender is bound (DTLS/ICE up);
+				// that is transient, so log and keep ticking rather than
+				// tearing the bridge down.
+				logger.Debugf("jitsi: rtp keepalive write: %v", err)
+			}
+		}
+	}
+}
+
+// wantsVideoReceive reports whether the carrier expects to receive remote
+// video (a handler is registered). When false and there are no local tracks,
+// the session is a pure byte-stream and needs the RTP keepalive track.
+func (s *Session) wantsVideoReceive() bool {
+	s.videoTrackMu.RLock()
+	defer s.videoTrackMu.RUnlock()
+	return s.onVideoTrack != nil
+}
+
+// newKeepaliveTrack builds a fresh sendonly VP8 track for the RTP keepalive.
+// IDs are randomised per negotiation because Jitsi rejects session-accept when
+// an msid collides with another participant in the conference.
+func newKeepaliveTrack() (*webrtc.TrackLocalStaticSample, error) {
+	return webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
+		"jitsi-ka-"+randomTrackSuffix(),
+		"olcrtc-ka-"+randomTrackSuffix(),
+	)
+}
+
+// randomTrackSuffix returns a short unique token for track/stream IDs.
+func randomTrackSuffix() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:])
+}
+
+
 // updates its endpoint lastActivity timestamp. Without this, JVB expires the
 // endpoint after its inactivity timeout (~30-60s) when the ICE/DTLS path is
 // routed through a TURN relay whose allocation silently dies.
