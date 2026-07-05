@@ -384,6 +384,82 @@ func TestWriterDrainsDatagramBeforeReliableData(t *testing.T) {
 	}
 }
 
+func TestWriterBatchesDatagramsWithSameRoute(t *testing.T) {
+	tr := &streamTransport{
+		datagramOutbound: make(chan []byte, 2),
+		batchSize:        8,
+	}
+	hdr := testEpochHdr(2)
+	first := append(append([]byte(nil), hdr[:]...), datagramMagic[:]...)
+	first = append(first, []byte("one")...)
+	second := append(append([]byte(nil), hdr[:]...), datagramMagic[:]...)
+	second = append(second, []byte("two")...)
+	tr.datagramOutbound <- second
+
+	var writes [][]byte
+	tr.sampleWriter = func(data []byte) bool {
+		writes = append(writes, append([]byte(nil), data...))
+		return true
+	}
+	w := &writerState{p: tr}
+	sample := w.batchDatagramSample(first)
+	if !w.writeSample(sample) {
+		t.Fatal("writeSample(datagram batch) = false, want true")
+	}
+	if len(writes) != 1 {
+		t.Fatalf("writes = %d, want 1", len(writes))
+	}
+	packets, ok := splitDatagramBatchPayload(writes[0][epochHdrLen:])
+	if !ok || len(packets) != 2 {
+		t.Fatalf("datagram batch packets=%d ok=%v, want 2/true", len(packets), ok)
+	}
+	assertDatagramPacketPayload(t, packets[0], "one")
+	assertDatagramPacketPayload(t, packets[1], "two")
+}
+
+func TestWriterKeepsDifferentDatagramRoutesSeparate(t *testing.T) {
+	tr := &streamTransport{
+		datagramOutbound: make(chan []byte, 2),
+		batchSize:        8,
+	}
+	first := mkDatagramFrame(bindingToken("server"), 0x200, 0x300, []byte("one"))
+	second := mkDatagramFrame(bindingToken("server"), 0x200, 0x400, []byte("two"))
+	tr.datagramOutbound <- second
+
+	w := &writerState{p: tr}
+	sample := w.batchDatagramSample(first)
+	packets, ok := splitDatagramBatchPayload(sample[epochHdrLen:])
+	if !ok || len(packets) != 1 {
+		t.Fatalf("datagram batch packets=%d ok=%v, want 1/true", len(packets), ok)
+	}
+	if w.pendingDatagram == nil {
+		t.Fatal("pendingDatagram = nil, want second route queued for next tick")
+	}
+	if !sameEpochHeader(w.pendingDatagram, second) {
+		t.Fatal("pendingDatagram route changed")
+	}
+}
+
+func TestHandleIncomingDatagramBatchPeerRouting(t *testing.T) {
+	got := make(chan string, 2)
+	tr := &streamTransport{
+		stream:       &fakeVideoStream{canSend: true},
+		bindingToken: bindingToken("server"),
+		localEpoch:   0x100,
+		onPeerData:   func(string, []byte) {},
+		onPeerDatagram: func(peerID string, data []byte) {
+			got <- peerID + ":" + string(data)
+		},
+	}
+
+	tr.handleIncomingFrame(mkDatagramBatchFrame(tr.bindingToken, 0x300, tr.localEpoch, [][]byte{
+		[]byte("one"),
+		[]byte("two"),
+	}))
+	assertStringReceived(t, got, "00000300:one")
+	assertStringReceived(t, got, "00000300:two")
+}
+
 func TestNewErrorPaths(t *testing.T) {
 	enginebuiltin.Register("vp8channel-create-fails", func(context.Context, enginebuiltin.Config) (engine.Session, error) {
 		return nil, errVP8UnitBoom
@@ -399,6 +475,26 @@ func TestNewErrorPaths(t *testing.T) {
 	_, err = New(context.Background(), transport.Config{Carrier: "vp8channel-no-video"})
 	if !errors.Is(err, ErrVideoTrackUnsupported) {
 		t.Fatalf("New() error = %v, want %v", err, ErrVideoTrackUnsupported)
+	}
+}
+
+func assertDatagramPacketPayload(t *testing.T, packet []byte, want string) {
+	t.Helper()
+	payload, ok := splitDatagramPayload(packet)
+	if !ok || string(payload) != want {
+		t.Fatalf("datagram packet payload=%q ok=%v, want %q/true", payload, ok, want)
+	}
+}
+
+func assertStringReceived(t *testing.T, ch <-chan string, want string) {
+	t.Helper()
+	select {
+	case got := <-ch:
+		if got != want {
+			t.Fatalf("received %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("did not receive %q", want)
 	}
 }
 
@@ -631,6 +727,18 @@ func mkDatagramFrame(token, src, dst uint32, payload []byte) []byte {
 	frame = append(frame, hdr[:]...)
 	frame = append(frame, datagramMagic[:]...)
 	frame = append(frame, payload...)
+	return frame
+}
+
+func mkDatagramBatchFrame(token, src, dst uint32, payloads [][]byte) []byte {
+	hdr := buildEpochHeaderTo(token, src, dst)
+	frame := make([]byte, 0, defaultMaxPayloadSize)
+	frame = append(frame, hdr[:]...)
+	frame = append(frame, datagramBatchMagic[:]...)
+	for _, payload := range payloads {
+		packet := append(append([]byte(nil), datagramMagic[:]...), payload...)
+		frame = appendBatchPacket(frame, packet)
+	}
 	return frame
 }
 

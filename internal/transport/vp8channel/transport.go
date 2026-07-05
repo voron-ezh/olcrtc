@@ -6,6 +6,7 @@
 package vp8channel
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -100,8 +101,9 @@ const (
 	controlEpochFlag uint32 = 0x80000000
 )
 
-var kcpBatchMagic = [4]byte{'O', 'L', 'K', 'B'} //nolint:gochecknoglobals // wire marker
-var datagramMagic = [4]byte{'O', 'L', 'U', 'D'} //nolint:gochecknoglobals // wire marker
+var kcpBatchMagic = [4]byte{'O', 'L', 'K', 'B'}      //nolint:gochecknoglobals // wire marker
+var datagramMagic = [4]byte{'O', 'L', 'U', 'D'}      //nolint:gochecknoglobals // wire marker
+var datagramBatchMagic = [4]byte{'O', 'L', 'U', 'B'} //nolint:gochecknoglobals // wire marker
 
 // videoSession is the subset of engine.Session + engine.VideoTrackCapable
 // the vp8channel transport relies on. It necessarily mirrors the engine's
@@ -866,15 +868,52 @@ func (w *writerState) drainDatagram() bool {
 	for {
 		select {
 		case frame := <-w.p.datagramOutbound:
+			sample := w.batchDatagramSample(frame)
 			w.idleTicks = 0
-			if !w.writeSample(frame) {
-				w.pendingDatagram = frame
+			if !w.writeSample(sample) {
+				w.pendingDatagram = sample
 				return false
 			}
 		default:
 			return true
 		}
 	}
+}
+
+func (w *writerState) batchDatagramSample(first []byte) []byte {
+	return w.batchDatagramSampleFrom(w.p.datagramOutbound, first)
+}
+
+func (w *writerState) batchDatagramSampleFrom(src <-chan []byte, first []byte) []byte {
+	if len(first) <= epochHdrLen || w.p.batchSize <= 1 {
+		return first
+	}
+	sample := make([]byte, 0, defaultMaxPayloadSize)
+	sample = append(sample, first[:epochHdrLen]...)
+	sample = append(sample, datagramBatchMagic[:]...)
+	sample = appendBatchPacket(sample, first[epochHdrLen:])
+	packets := 1
+	for ; packets < w.p.batchSize; packets++ {
+		select {
+		case frame := <-src:
+			if !sameEpochHeader(first, frame) {
+				w.pendingDatagram = frame
+				return sample
+			}
+			payload := frame[epochHdrLen:]
+			if len(sample)+2+len(payload) > defaultMaxPayloadSize {
+				w.pendingDatagram = frame
+				return sample
+			}
+			sample = appendBatchPacket(sample, payload)
+		default:
+			if packets == 1 {
+				return first
+			}
+			return sample
+		}
+	}
+	return sample
 }
 
 // drainData sends one batched data frame, or a keepalive when idle.
@@ -1272,6 +1311,10 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 		p.handleControlFrame(src, dst, kcpPayload)
 		return
 	}
+	if packets, ok := splitDatagramBatchPayload(kcpPayload); ok {
+		p.handleDatagramBatchFrame(src, packets)
+		return
+	}
 	if payload, ok := splitDatagramPayload(kcpPayload); ok {
 		p.handleDatagramFrame(src, payload)
 		return
@@ -1294,6 +1337,38 @@ func splitDatagramPayload(payload []byte) ([]byte, bool) {
 	return payload[len(datagramMagic):], true
 }
 
+func splitDatagramBatchPayload(payload []byte) ([][]byte, bool) {
+	if len(payload) < len(datagramBatchMagic) ||
+		string(payload[:len(datagramBatchMagic)]) != string(datagramBatchMagic[:]) {
+		return nil, false
+	}
+	rest := payload[len(datagramBatchMagic):]
+	packets := make([][]byte, 0, 4)
+	for len(rest) > 0 {
+		if len(rest) < 2 {
+			return nil, false
+		}
+		size := int(binary.BigEndian.Uint16(rest[:2]))
+		rest = rest[2:]
+		if size == 0 || len(rest) < size {
+			return nil, false
+		}
+		packets = append(packets, rest[:size])
+		rest = rest[size:]
+	}
+	return packets, true
+}
+
+func (p *streamTransport) handleDatagramBatchFrame(src uint32, packets [][]byte) {
+	for _, packet := range packets {
+		payload, ok := splitDatagramPayload(packet)
+		if !ok {
+			continue
+		}
+		p.handleDatagramFrame(src, payload)
+	}
+}
+
 func (p *streamTransport) handleDatagramFrame(src uint32, payload []byte) {
 	if p.onPeerData != nil {
 		if p.onPeerDatagram != nil {
@@ -1313,6 +1388,10 @@ func (p *streamTransport) handleDatagramFrame(src uint32, payload []byte) {
 	if p.onDatagram != nil {
 		p.onDatagram(payload)
 	}
+}
+
+func sameEpochHeader(a, b []byte) bool {
+	return len(a) >= epochHdrLen && len(b) >= epochHdrLen && bytes.Equal(a[:epochHdrLen], b[:epochHdrLen])
 }
 
 // handleSinglePeerData delivers a data frame in single-peer (client) mode. It

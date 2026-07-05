@@ -69,3 +69,10 @@ TUN or SOCKS client -> olcRTC client -> carrier transport -> olcRTC server -> in
 
 Record the transport, carrier, OS, device, packet-loss condition, and whether
 the test used TCP stream traffic or UDP datagrams.
+
+For `vp8channel` UDP datagrams, the writer batches multiple queued datagrams
+with the same peer route into one VP8 sample. This avoids limiting datagram
+throughput to the SFU video frame rate. Voice and other low-bitrate realtime
+UDP are the intended targets. Adaptive video calls can still reduce bitrate
+heavily over vp8-over-SFU because RTT and jitter remain much higher than on a
+native UDP path, even when packet loss is near zero.
